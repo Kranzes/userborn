@@ -90,6 +90,7 @@
             '';
 
             packages = [
+              pkgs.nix-eval-jobs
               pkgs.nixfmt
               pkgs.clippy
               pkgs.rustfmt
@@ -105,6 +106,23 @@
             inputsFrom = [ self.packages.${system}.userborn ];
 
             RUST_SRC_PATH = "${pkgs.rust.packages.stable.rustPlatform.rustLibSrc}";
+          };
+
+          ci = pkgs.mkShell {
+            packages = [
+              (pkgs.writeShellApplication {
+                name = "eval-checks";
+
+                runtimeInputs = [
+                  pkgs.nix-eval-jobs
+                  pkgs.jq
+                ];
+
+                text = ''
+                  nix-eval-jobs --check-cache-status --flake .\#checks.x86_64-linux | jq -s 'map({attr, isCached})'
+                '';
+              })
+            ];
           };
         }
       );

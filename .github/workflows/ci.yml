@@ -1,4 +1,4 @@
-name: "Run nix flake check"
+name: "CI"
 
 on:
   push:
@@ -6,13 +6,46 @@ on:
   pull_request:
   merge_group:
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: samueldr/lix-gha-installer-action@v2025-10-27
-      - run: nix flake check --log-format raw-with-logs -L
-
 env:
   FORCE_COLOR: 1
+
+jobs:
+  eval:
+    name: Evaluate
+    runs-on: ubuntu-latest
+    outputs:
+      stdout: ${{ steps.nix-eval-jobs.outputs.stdout }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: samueldr/lix-gha-installer-action@v2026-06-15
+      - name: Run nix-eval-jobs
+        id: nix-eval-jobs
+        run: |
+          {
+            echo 'stdout<<EOF'
+            nix develop .\#devShells.x86_64-linux.ci --command eval-checks
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: [ eval ]
+    name: Build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        derivation: ${{ fromJson(needs.eval.outputs.stdout) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: samueldr/lix-gha-installer-action@v2026-06-15
+      - name: Build ${{ matrix.derivation.attr }}
+        run: nix build .\#checks.x86_64-linux.${{ matrix.derivation.attr }}
+        if: ${{ ! matrix.derivation.isCached }}
+
+  # Only here for branch protection rules
+  build-status:
+    needs: [ build ]
+    name: Build Status
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+    - run: ${{!contains(needs.build.result, 'failure')}}
