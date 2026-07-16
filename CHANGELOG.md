@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.0 (Unreleased)
+## 1.0.0
 
 - Removed the ability to configure the path to the `nologin` binary during
   runtime via the env variable `USERBORN_NO_LOGIN_PATH`. Instead, configure the
