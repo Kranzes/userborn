@@ -259,7 +259,35 @@ fn update_users_and_groups(
         groups_in_config.insert(&group_config.name);
 
         if let Some(existing_entry) = group_db.get_mut(&group_config.name) {
-            existing_entry.update(group_config.members.clone());
+            if let Some(previous_config) = previous_config {
+                // Group membership is the union:
+                // (existing - previous_configured) ∪ current_configured
+                // This preserves pre-existing members while allowing removal of
+                // members that were previously managed by config.
+                let previous_members = previous_config
+                    .groups
+                    .iter()
+                    .find(|g| g.name == group_config.name)
+                    .map(|g| &g.members);
+
+                let without_previous_members = if let Some(previous_members) = previous_members {
+                    existing_entry
+                        .members()
+                        .difference(previous_members)
+                        .cloned()
+                        .collect()
+                } else {
+                    existing_entry.members().clone()
+                };
+
+                let desired_members = without_previous_members
+                    .union(&group_config.members)
+                    .cloned()
+                    .collect();
+                existing_entry.update(desired_members);
+            } else {
+                existing_entry.update(group_config.members.clone());
+            }
         } else if let Err(e) = create_group(group_config, group_db) {
             log::error!("Failed to create group {}: {e:#}", group_config.name);
         }
@@ -283,7 +311,8 @@ fn update_users_and_groups(
         }
     }
 
-    // Find groups in the DB that are not in the config and empty them.
+    // Find groups in the DB that are not in the config and empty them. Make sure to not empty
+    // groups of users for who this is their implicit primary group.
     let previous_groups = previous_config.map(Config::group_names);
     for entry in group_db.entries_mut() {
         if previous_groups
@@ -292,7 +321,26 @@ fn update_users_and_groups(
             && !groups_in_config.contains(entry.name())
         {
             log::info!("Draining users from group {}...", entry.name());
-            if implicit_primary_groups.contains(entry.name()) {
+            if let Some(previous_config) = previous_config {
+                let previous_members = previous_config
+                    .groups
+                    .iter()
+                    .find(|g| g.name == entry.name())
+                    .map(|g| &g.members);
+
+                if let Some(previous_members) = previous_members {
+                    let mut without_previous_members = entry
+                        .members()
+                        .difference(previous_members)
+                        .cloned()
+                        .collect::<BTreeSet<String>>();
+
+                    if implicit_primary_groups.contains(entry.name()) {
+                        without_previous_members.insert(entry.name().to_string());
+                    }
+                    entry.update(without_previous_members);
+                }
+            } else if implicit_primary_groups.contains(entry.name()) {
                 entry.update(BTreeSet::from([entry.name().to_owned()]));
             } else {
                 entry.update(BTreeSet::new());
@@ -968,6 +1016,193 @@ mod tests {
             ],
         }))?;
         assert!(update_subids(&bad, &mut sub_ids).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn preserve_preexisting_members_on_activation_mutable() -> Result<()> {
+        let mut group_db = Group::default();
+        let mut passwd_db = Passwd::default();
+        let mut shadow_db = Shadow::default();
+
+        group_db.insert(&group::Entry::new(
+            "wheel".into(),
+            10,
+            BTreeSet::from(["initial".into()]),
+        ))?;
+
+        let expected_group = expect![[r#"
+            wheel:x:10:initial
+        "#]];
+        expected_group.assert_eq(&group_db.to_buffer());
+
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "users": [
+                {
+                    "isNormal": true,
+                    "name": "normalo",
+                    "home": "/home/normalo",
+                    "shell": "/bin/bash",
+                },
+                {
+                    "isNormal": false,
+                    "name": "initial",
+                },
+            ],
+            "groups": [
+                {
+                    "name": "wheel",
+                    "gid": 10,
+                    "members": ["initial", "normalo"],
+                }
+            ],
+        }))?;
+
+        update_users_and_groups(
+            &config,
+            Some(&config),
+            &mut group_db,
+            &mut passwd_db,
+            &mut shadow_db,
+        );
+
+        let expected_group = expect![[r#"
+            wheel:x:10:initial,normalo
+            initial:x:999:initial
+            normalo:x:1000:normalo
+        "#]];
+        expected_group.assert_eq(&group_db.to_buffer());
+
+        Ok(())
+    }
+
+    #[test]
+    fn remove_only_configured_members_on_deactivation_mutable() -> Result<()> {
+        let mut group_db = Group::default();
+        let mut passwd_db = Passwd::default();
+        let mut shadow_db = Shadow::default();
+
+        group_db.insert(&group::Entry::new(
+            "wheel".into(),
+            10,
+            BTreeSet::from(["initial".into(), "normalo".into()]),
+        ))?;
+
+        let previous_config: Config = serde_json::from_value(serde_json::json!({
+            "users": [],
+            "groups": [
+                {
+                    "name": "wheel",
+                    "gid": 10,
+                    "members": ["normalo"],
+                }
+            ],
+        }))?;
+
+        // Deactivation
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "users": [],
+            "groups": [],
+        }))?;
+
+        update_users_and_groups(
+            &config,
+            Some(&previous_config),
+            &mut group_db,
+            &mut passwd_db,
+            &mut shadow_db,
+        );
+
+        let expected_group = expect![[r#"
+            wheel:x:10:initial
+        "#]];
+        expected_group.assert_eq(&group_db.to_buffer());
+
+        Ok(())
+    }
+
+    #[test]
+    fn remove_member_when_removed_from_config_mutable() -> Result<()> {
+        let mut group_db = Group::default();
+        let mut passwd_db = Passwd::default();
+        let mut shadow_db = Shadow::default();
+
+        group_db.insert(&group::Entry::new(
+            "wheel".into(),
+            10,
+            BTreeSet::from(["imperative".into()]),
+        ))?;
+
+        let gen0: Config = serde_json::from_value(serde_json::json!({
+            "users": [
+                {
+                    "isNormal": false,
+                    "name": "initial",
+                },
+                {
+                    "isNormal": true,
+                    "name": "normalo",
+                },
+            ],
+            "groups": [
+                {
+                    "name": "wheel",
+                    "gid": 10,
+                    "members": ["initial", "normalo"],
+                }
+            ],
+        }))?;
+
+        update_users_and_groups(
+            &gen0,
+            Some(&gen0),
+            &mut group_db,
+            &mut passwd_db,
+            &mut shadow_db,
+        );
+
+        let expected_group = expect![[r#"
+            wheel:x:10:imperative,initial,normalo
+            initial:x:999:initial
+            normalo:x:1000:normalo
+        "#]];
+        expected_group.assert_eq(&group_db.to_buffer());
+
+        let gen1: Config = serde_json::from_value(serde_json::json!({
+            "users": [
+                {
+                    "isNormal": false,
+                    "name": "initial",
+                },
+                {
+                    "isNormal": true,
+                    "name": "normalo",
+                },
+            ],
+            "groups": [
+                {
+                    "name": "wheel",
+                    "gid": 10,
+                    "members": ["initial"],
+                }
+            ],
+        }))?;
+
+        update_users_and_groups(
+            &gen1,
+            Some(&gen0),
+            &mut group_db,
+            &mut passwd_db,
+            &mut shadow_db,
+        );
+
+        let expected_group = expect![[r#"
+            wheel:x:10:imperative,initial
+            initial:x:999:initial
+            normalo:x:1000:normalo
+        "#]];
+        expected_group.assert_eq(&group_db.to_buffer());
 
         Ok(())
     }
