@@ -259,7 +259,7 @@ fn update_users_and_groups(
         groups_in_config.insert(&group_config.name);
 
         if let Some(existing_entry) = group_db.get_mut(&group_config.name) {
-            if let Some(previous_config) = previous_config {
+            let desired_members = if let Some(previous_config) = previous_config {
                 // Group membership is the union:
                 // (existing - previous_configured) ∪ current_configured
                 // This preserves pre-existing members while allowing removal of
@@ -280,14 +280,14 @@ fn update_users_and_groups(
                     existing_entry.members().clone()
                 };
 
-                let desired_members = without_previous_members
+                without_previous_members
                     .union(&group_config.members)
                     .cloned()
-                    .collect();
-                existing_entry.update(desired_members);
+                    .collect()
             } else {
-                existing_entry.update(group_config.members.clone());
-            }
+                group_config.members.clone()
+            };
+            existing_entry.update(desired_members);
         } else if let Err(e) = create_group(group_config, group_db) {
             log::error!("Failed to create group {}: {e:#}", group_config.name);
         }
@@ -320,8 +320,7 @@ fn update_users_and_groups(
             .is_none_or(|g| g.contains(entry.name()))
             && !groups_in_config.contains(entry.name())
         {
-            log::info!("Draining users from group {}...", entry.name());
-            if let Some(previous_config) = previous_config {
+            let desired_members = if let Some(previous_config) = previous_config {
                 let previous_members = previous_config
                     .groups
                     .iter()
@@ -338,13 +337,20 @@ fn update_users_and_groups(
                     if implicit_primary_groups.contains(entry.name()) {
                         without_previous_members.insert(entry.name().to_string());
                     }
-                    entry.update(without_previous_members);
+                    without_previous_members
+                } else {
+                    entry.members().to_owned()
                 }
             } else if implicit_primary_groups.contains(entry.name()) {
-                entry.update(BTreeSet::from([entry.name().to_owned()]));
+                BTreeSet::from([entry.name().to_owned()])
             } else {
-                entry.update(BTreeSet::new());
+                BTreeSet::new()
+            };
+
+            if entry.members() != &desired_members {
+                log::info!("Draining users from group {}...", entry.name());
             }
+            entry.update(desired_members);
         }
     }
 
